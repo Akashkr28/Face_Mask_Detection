@@ -7,14 +7,17 @@ Usage:
 
 import tempfile
 import time
+import threading
 from collections import deque
 from pathlib import Path
 
+import av
 import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
 from PIL import Image
+from streamlit_webrtc import WebRtcMode, webrtc_streamer
 from ultralytics import YOLO
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -23,11 +26,25 @@ CLASS_COLORS_RGB = {0: (0, 200, 0), 1: (220, 0, 0), 2: (255, 165, 0)}
 DEFAULT_WEIGHTS = "runs/detect/mask_detector/weights/best.pt"
 HISTORY_LEN = 100  # frames to keep for compliance chart
 
+# ── Module-level webcam inference state (persists across Streamlit reruns) ────
+_wc_lock = threading.Lock()
+_wc_latest_frame = {"img": None}
+_wc_latest_result = {"boxes": [], "counts": {0: 0, 1: 0, 2: 0}}
+_wc_thread_started = False
+
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 @st.cache_resource
 def load_model(weights_path: str):
     return YOLO(weights_path)
+
+@st.cache_resource
+def load_webcam_model():
+    """Load ONNX model for faster webcam inference."""
+    onnx_path = "runs/detect/mask_detector/weights/best.onnx"
+    pt_path = "runs/detect/mask_detector/weights/best.pt"
+    path = onnx_path if Path(onnx_path).exists() else pt_path
+    return YOLO(path)
 
 
 # ── Drawing ───────────────────────────────────────────────────────────────────
@@ -203,42 +220,117 @@ with tab_video:
         progress_bar.progress(1.0)
         st.success("Video processing complete.")
 
+# ── Start background inference thread (module level, runs once) ───────────────
+def _start_inference_thread():
+    global _wc_thread_started
+    if _wc_thread_started:
+        return
+    _wc_model = load_webcam_model()
+
+    def _inference_worker():
+        while True:
+            with _wc_lock:
+                img = _wc_latest_frame["img"]
+            if img is None:
+                time.sleep(0.01)
+                continue
+            small = cv2.resize(img, (640, 640))
+            results = _wc_model(small, imgsz=640, conf=0.35, verbose=False)
+            scale_x = img.shape[1] / 640
+            scale_y = img.shape[0] / 640
+            boxes_out = []
+            counts = {0: 0, 1: 0, 2: 0}
+            for box in results[0].boxes:
+                c = float(box.conf)
+                if c < 0.35:
+                    continue
+                cls_id = int(box.cls)
+                counts[cls_id] += 1
+                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                boxes_out.append((
+                    int(x1 * scale_x), int(y1 * scale_y),
+                    int(x2 * scale_x), int(y2 * scale_y),
+                    cls_id, c
+                ))
+            with _wc_lock:
+                _wc_latest_result["boxes"] = boxes_out
+                _wc_latest_result["counts"] = counts
+
+    threading.Thread(target=_inference_worker, daemon=True).start()
+    _wc_thread_started = True
+
+_start_inference_thread()
+
 # ── Webcam tab ────────────────────────────────────────────────────────────────
 with tab_webcam:
-    st.info(
-        "**Best experience:** run the OpenCV script directly for true real-time performance:\n"
-        "```\npython detect_webcam.py\n```"
+    st.markdown("### Live Webcam Detection")
+    st.caption("Allow camera access when prompted by your browser.")
+
+    if "wc_counts" not in st.session_state:
+        st.session_state.wc_counts = {0: 0, 1: 0, 2: 0}
+    if "wc_history" not in st.session_state:
+        st.session_state.wc_history = deque(maxlen=HISTORY_LEN)
+
+    def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
+        img = frame.to_ndarray(format="bgr24")
+        # Non-blocking: drop latest frame for inference, read last result
+        with _wc_lock:
+            _wc_latest_frame["img"] = img.copy()
+            boxes = list(_wc_latest_result["boxes"])
+            counts = dict(_wc_latest_result["counts"])
+        # Draw last known boxes immediately — never waits for inference
+        annotated = img.copy()
+        for (x1, y1, x2, y2, cls_id, conf) in boxes:
+            color_bgr = CLASS_COLORS_RGB.get(cls_id, (180, 180, 180))[::-1]
+            label = f"{CLASS_NAMES[cls_id]} {conf:.0%}"
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), color_bgr, 2)
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+            cv2.rectangle(annotated, (x1, y1 - th - 6), (x1 + tw + 4, y1), color_bgr, -1)
+            cv2.putText(annotated, label, (x1 + 2, y1 - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+        return av.VideoFrame.from_ndarray(
+            cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), format="rgb24"
+        )
+
+    RTC_CONFIGURATION = {
+        "iceServers": [
+            {"urls": ["stun:stun.l.google.com:19302"]},
+            {"urls": ["stun:stun1.l.google.com:19302"]},
+            {
+                "urls": ["turn:openrelay.metered.ca:80"],
+                "username": "openrelayproject",
+                "credential": "openrelayproject",
+            },
+            {
+                "urls": ["turn:openrelay.metered.ca:443"],
+                "username": "openrelayproject",
+                "credential": "openrelayproject",
+            },
+            {
+                "urls": ["turn:openrelay.metered.ca:443?transport=tcp"],
+                "username": "openrelayproject",
+                "credential": "openrelayproject",
+            },
+        ]
+    }
+
+    webrtc_ctx = webrtc_streamer(
+        key="mask-detection",
+        mode=WebRtcMode.SENDRECV,
+        video_frame_callback=video_frame_callback,
+        media_stream_constraints={"video": {"width": 640, "height": 480}, "audio": False},
+        async_processing=True,
+        rtc_configuration=RTC_CONFIGURATION,
     )
-    st.markdown("Or use the in-browser webcam below:")
 
-    run_webcam = st.toggle("▶️ Start webcam")
-    frame_placeholder_wc = st.empty()
-    stats_placeholder_wc = st.empty()
-    compliance_history_wc = deque(maxlen=HISTORY_LEN)
-
-    if run_webcam:
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            st.error("Could not open webcam.")
-        else:
-            while run_webcam:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                results = model(frame, imgsz=imgsz, conf=conf_threshold, verbose=False)
-                annotated, counts = draw_boxes(frame, results, conf_threshold)
-
-                total = sum(counts.values())
-                compliance = (counts[0] / total * 100) if total > 0 else 0.0
-                compliance_history_wc.append(compliance)
-
-                frame_placeholder_wc.image(
-                    annotated, channels="RGB", use_container_width=True
-                )
-                with stats_placeholder_wc.container():
-                    show_stats(counts, compliance_history_wc)
-                time.sleep(0.05)
-            cap.release()
+    if webrtc_ctx.state.playing:
+        with _wc_lock:
+            counts = dict(_wc_latest_result["counts"])
+        st.session_state.wc_counts = counts
+        total = sum(counts.values())
+        compliance = (counts[0] / total * 100) if total > 0 else 0.0
+        st.session_state.wc_history.append(compliance)
+        show_stats(st.session_state.wc_counts, st.session_state.wc_history)
 
 # ── About tab ─────────────────────────────────────────────────────────────────
 with tab_about:

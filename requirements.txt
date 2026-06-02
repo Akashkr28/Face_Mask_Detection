@@ -1,9 +1,12 @@
 ultralytics>=8.2.0
 opencv-python-headless>=4.8.0
 streamlit>=1.32.0
+streamlit-webrtc>=0.47.0
 Pillow>=10.0.0
 numpy>=1.24.0
 pandas>=2.0.0
 torch>=2.0.0
 torchvision>=0.15.0
 onnxruntime>=1.16.0
+av>=10.0.0
+aiortc>=1.6.0
