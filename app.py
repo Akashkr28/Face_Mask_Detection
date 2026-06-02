@@ -114,7 +114,7 @@ st.caption(
 with st.sidebar:
     st.header("⚙️ Settings")
     weights_input = st.text_input("Model weights", value=DEFAULT_WEIGHTS)
-    conf_threshold = st.slider("Confidence threshold", 0.05, 0.95, 0.35, 0.05)
+    conf_threshold = st.slider("Confidence threshold", 0.05, 0.95, 0.55, 0.05)
     imgsz = st.selectbox("Inference size", [320, 480, 640], index=2)
 
     st.divider()
@@ -235,14 +235,14 @@ def _start_inference_thread():
                 time.sleep(0.01)
                 continue
             small = cv2.resize(img, (640, 640))
-            results = _wc_model(small, imgsz=640, conf=0.35, verbose=False)
+            results = _wc_model(small, imgsz=640, conf=0.55, verbose=False)
             scale_x = img.shape[1] / 640
             scale_y = img.shape[0] / 640
             boxes_out = []
             counts = {0: 0, 1: 0, 2: 0}
             for box in results[0].boxes:
                 c = float(box.conf)
-                if c < 0.35:
+                if c < 0.55:
                     continue
                 cls_id = int(box.cls)
                 counts[cls_id] += 1
@@ -318,7 +318,14 @@ with tab_webcam:
         key="mask-detection",
         mode=WebRtcMode.SENDRECV,
         video_frame_callback=video_frame_callback,
-        media_stream_constraints={"video": {"width": 640, "height": 480}, "audio": False},
+        media_stream_constraints={
+            "video": {
+                "width": {"ideal": 1920, "min": 1280},
+                "height": {"ideal": 1080, "min": 720},
+                "frameRate": {"ideal": 30, "min": 15},
+            },
+            "audio": False,
+        },
         async_processing=True,
         rtc_configuration=RTC_CONFIGURATION,
     )
